@@ -32,6 +32,11 @@ class ModelHandler:
     def __init__(self):
         self.base = None
         self.refiner = None
+        # img2img built from the base pipeline's components -> ~0 extra VRAM.
+        # Upstream routed image_url through the *refiner only*, which silently dropped
+        # negative_prompt / guidance_scale / width / height and pushed the refiner well
+        # outside its designed strength range (~0.2-0.3). See FORK_NOTES.md.
+        self.img2img = None
         self.load_models()
 
     def load_base(self):
@@ -54,17 +59,16 @@ class ModelHandler:
         
         # Enable memory optimizations
         base_pipe.enable_xformers_memory_efficient_attention()
-        base_pipe.enable_model_cpu_offload()
+        # NOTE: enable_model_cpu_offload() removed. This endpoint runs on 24GB (ADA_24)
+        # where the whole pipeline fits, so offloading only adds CPU<->GPU round trips
+        # per forward pass. It also breaks IP-Adapter if loaded before the adapter.
 
         return base_pipe
 
     def load_refiner(self):
-        # Load VAE from cache using identifier
-        vae = AutoencoderKL.from_pretrained(
-            "madebyollin/sdxl-vae-fp16-fix",
-            torch_dtype=torch.float16,
-            local_files_only=True,
-        )
+        # Reuse the VAE already loaded for the base pipeline instead of loading a
+        # second copy of the same weights.
+        vae = self.base.vae
         # Load Refiner Pipeline from cache using identifier
         refiner_pipe = StableDiffusionXLImg2ImgPipeline.from_pretrained(
             "stabilityai/stable-diffusion-xl-refiner-1.0",
@@ -78,13 +82,16 @@ class ModelHandler:
         
         # Enable memory optimizations
         refiner_pipe.enable_xformers_memory_efficient_attention()
-        refiner_pipe.enable_model_cpu_offload()
 
         return refiner_pipe
 
     def load_models(self):
         self.base = self.load_base()
         self.refiner = self.load_refiner()
+        # Share the base pipeline's components: same UNet/VAE/text encoders already on GPU.
+        # This is what image_url should have been using all along.
+        self.img2img = StableDiffusionXLImg2ImgPipeline(**self.base.components)
+        self.img2img.enable_xformers_memory_efficient_attention()
 
 
 MODELS = ModelHandler()
@@ -183,17 +190,31 @@ def generate_image(job):
         job_input["scheduler"], MODELS.base.scheduler.config
     )
 
-    if starting_image:  # If image_url is provided, run only the refiner pipeline
+    if starting_image:
+        # img2img on the BASE checkpoint (not the refiner).
+        #
+        # Upstream sent this through MODELS.refiner, which meant:
+        #   - the base checkpoint was never used, so swapping checkpoints did nothing here
+        #   - negative_prompt / guidance_scale / width / height / num_images were dropped
+        #   - the refiner is a low-noise end-of-schedule model (~0.2-0.3); typical
+        #     img2img strengths (0.5+) are outside what it was trained for
+        # Everything the schema accepts is honoured now.
         init_image = load_image(starting_image).convert("RGB")
+        MODELS.img2img.scheduler = make_scheduler(
+            job_input["scheduler"], MODELS.img2img.scheduler.config
+        )
         with torch.inference_mode():
-            refiner_result = MODELS.refiner(
+            img2img_result = MODELS.img2img(
                 prompt=job_input["prompt"],
-                num_inference_steps=job_input["refiner_inference_steps"],
-                strength=job_input["strength"],
+                negative_prompt=job_input["negative_prompt"],
                 image=init_image,
+                strength=job_input["strength"],
+                num_inference_steps=job_input["num_inference_steps"],
+                guidance_scale=job_input["guidance_scale"],
+                num_images_per_prompt=job_input["num_images"],
                 generator=generator,
             )
-            output = refiner_result.images
+            output = img2img_result.images
     else:
         try:
             # Generate latent image using base pipeline
@@ -256,8 +277,9 @@ def generate_image(job):
         "seed": job_input["seed"],
     }
 
-    if starting_image:
-        results["refresh_worker"] = True
+    # NOTE: upstream set results["refresh_worker"] = True for every image_url job,
+    # which kills the worker after each one. With max_workers=1 that means a cold
+    # start (full model reload) on every reference-image request. Removed.
 
     return results
 
